@@ -1,0 +1,10 @@
+{
+  "uuid": "dock-folders@psouranis.github.io",
+  "name": "Dock Folders",
+  "description": "GNOME's app folders in Dash to Dock: a folder icon that opens a pop-up grid of its apps, red unread badges, and no separate dock icons for the apps inside. Drag a folder to move it; choose the folders in the settings.",
+  "shell-version": [
+    "48"
+  ],
+  "version": 2,
+  "url": "https://github.com/psouranis/dock-folders"
+}

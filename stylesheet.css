@@ -1,0 +1,50 @@
+/* Dock Folders. The dock icon's size, radius and
+   padding are set in extension.js from the dock's icon size. */
+
+/* The dock icon: a translucent rounded square. */
+.dock-folder-icon {
+  background-color: rgba(255, 255, 255, 0.16);
+}
+.dock-folder-button:hover .dock-folder-icon,
+.dock-folder-button:focus .dock-folder-icon {
+  background-color: rgba(255, 255, 255, 0.28);
+}
+.dock-folder-button:checked .dock-folder-icon {
+  background-color: rgba(255, 255, 255, 0.36);
+}
+/* An app dragged over the folder: it goes in on release. */
+.dock-folder-button:drop .dock-folder-icon {
+  background-color: rgba(255, 255, 255, 0.5);
+  border: 2px solid rgba(255, 255, 255, 0.85);
+}
+
+/* The pop-up. */
+.dock-folder-popup {
+  padding: 6px 10px 10px;
+  spacing: 10px;
+}
+.dock-folder-title {
+  font-weight: bold;
+  font-size: 1.1em;
+}
+.dock-folder-cell {
+  margin: 2px 4px;
+}
+.dock-folder-app-name {
+  margin-top: 6px;
+  font-size: 0.9em;
+  max-width: 84px;
+}
+/* Unread counts. In the dock the folder's badge is Dash to Dock's own
+   .notification-badge; the pop-up is outside the dock, so the same look is
+   repeated here (Dash to Dock's stylesheet.css). The font size is set in
+   extension.js, as Dash to Dock sets its own. */
+.dock-folder-badge {
+  color: white;
+  background-color: red;
+  padding: 0.2em 0.5em;
+  border-radius: 1em;
+  font-weight: bold;
+  text-align: center;
+  margin: 2px;
+}
