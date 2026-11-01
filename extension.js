@@ -28,7 +28,8 @@
 //   - the folder icons sit in the dock's own row of icons (its _box). That row
 //     is Dash to Dock's to redraw, so its insert_child_at_index is wrapped to
 //     count only its own icons, and the folders are put back in place after
-//     every change;
+//     every change; its Super+number shortcuts (_activateApp) skip the
+//     folders, as its number overlays do;
 //   - the counts are the ones Dash to Dock puts on its own icons: the app's
 //     launcher count (Signal, Slack, Discord set one) plus its unread GNOME
 //     notifications (dockManager.remoteModel, .notificationsMonitor);
@@ -57,26 +58,20 @@ import {Extension, gettext as _} from 'resource:///org/gnome/shell/extensions/ex
 import {ExtensionState} from 'resource:///org/gnome/shell/misc/extensionUtils.js';
 
 import {
-    KNOWN_SINGLE_WINDOW_APPS, configFile, readConfig, readSingleWindowApps, writeConfig,
+    KNOWN_SINGLE_WINDOW_APPS, configFile, folderName, folderSettings, readConfig,
+    readSingleWindowApps, writeConfig,
 } from './config.js';
+import {placeFolders, rawIndex} from './order.js';
 
 const DASH_TO_DOCK = 'dash-to-dock@micxgx.gmail.com';
-const FOLDER_SCHEMA = 'org.gnome.desktop.app-folders.folder';
 const POPUP_ICON_SIZE = 56;
 const POPUP_COLUMNS = 4;
 
-function folderSettings(id) {
-    return new Gio.Settings({
-        schema_id: FOLDER_SCHEMA,
-        path: `/org/gnome/desktop/app-folders/folders/${id}/`,
-    });
-}
-
-function folderName(settings) {
-    const name = settings.get_string('name');
-    if (settings.get_boolean('translate'))
-        return Shell.util_get_translated_folder_name(name) ?? name;
-    return name;
+// Out of the dock's pinned apps: a folder stands for it now.
+function unpin(app) {
+    const favorites = AppFavorites.getAppFavorites();
+    if (favorites.isFavorite(app.id))
+        favorites.removeFavorite(app.id);
 }
 
 function folderApps(settings) {
@@ -253,12 +248,6 @@ const FolderIcon = GObject.registerClass({
         this._iconContainer.add_child(this._dot);
         this._dot.hide();
     }
-
-    // Dash to Dock's Super+number shortcuts call this on every child of its
-    // row with an `app` (docking.js, _activateApp): on a folder it opens it.
-    activate(button = 1) {
-        this.emit('clicked', button);
-    }
 });
 
 // One folder in one dock.
@@ -326,10 +315,7 @@ class DockFolder {
     }
 
     _makeMenu(side, styleClass) {
-        return this._registerMenu(new PopupMenu.PopupMenu(this._button, 0.5, side), styleClass);
-    }
-
-    _registerMenu(menu, styleClass) {
+        const menu = new PopupMenu.PopupMenu(this._button, 0.5, side);
         menu.actor.add_style_class_name(styleClass);
         Main.uiGroup.add_child(menu.actor);
         menu.actor.hide();
@@ -763,9 +749,11 @@ export default class DockFoldersExtension extends Extension {
     }
 
     // An app's unread count, worked out as Dash to Dock does for its icons.
+    // No badges at all with its "show icons emblems" off, or in Do Not
+    // Disturb (appIconIndicators.js, AppIconIndicator).
     count(app) {
         const manager = this._manager;
-        if (!manager)
+        if (!manager?.settings?.showIconsEmblems || manager.notificationsMonitor?.dndMode)
             return 0;
         const entry = manager.remoteModel?.lookupById(app.id);
         const launcher = entry?.['count-visible'] ? entry.count ?? 0 : 0;
@@ -783,27 +771,41 @@ export default class DockFoldersExtension extends Extension {
         const children = new Gio.Settings({schema_id: 'org.gnome.desktop.app-folders'})
             .get_strv('folder-children');
         for (const other of children) {
-            if (other === id)
-                continue;
-            const settings = folderSettings(other);
-            const apps = settings.get_strv('apps');
-            if (apps.includes(app.id))
-                settings.set_strv('apps', apps.filter(a => a !== app.id));
+            if (other !== id)
+                this._removeApp(other, app);
         }
         const settings = folderSettings(id);
         settings.set_strv('apps', [...settings.get_strv('apps'), app.id]);
-        const favorites = AppFavorites.getAppFavorites();
-        if (favorites.isFavorite(app.id))
-            favorites.removeFavorite(app.id);
+        unpin(app);
     }
 
     // An app dragged out of a folder: out of the folder, and unpinned.
     removeFromFolder(id, app) {
+        this._removeApp(id, app);
+        unpin(app);
+    }
+
+    // Takes `app` out of folder `id`. With no app left, the folder is
+    // deleted as Show Apps deletes it (appDisplay.js, removeApp), and leaves
+    // the dock's config; its hidden icon goes at the next rebuild.
+    _removeApp(id, app) {
         const settings = folderSettings(id);
-        settings.set_strv('apps', settings.get_strv('apps').filter(a => a !== app.id));
-        const favorites = AppFavorites.getAppFavorites();
-        if (favorites.isFavorite(app.id))
-            favorites.removeFavorite(app.id);
+        const apps = settings.get_strv('apps');
+        if (!apps.includes(app.id))
+            return;
+        if (apps.length > 1) {
+            settings.set_strv('apps', apps.filter(a => a !== app.id));
+            return;
+        }
+        for (const key of settings.settings_schema.list_keys())
+            settings.reset(key);
+        const folders = new Gio.Settings({schema_id: 'org.gnome.desktop.app-folders'});
+        folders.set_strv('folder-children',
+            folders.get_strv('folder-children').filter(f => f !== id));
+        if (this._entry(id)) {
+            this._config = this._config.filter(f => f.id !== id);
+            this._save();
+        }
     }
 
     // --- Moving a folder by dragging it -------------------------------------
@@ -868,16 +870,18 @@ export default class DockFoldersExtension extends Extension {
             this._singleWindow.has(app.id));
     }
 
-    // New Window was picked for a running app: if it has no more windows a
-    // few seconds later, it's one that hands a second launch over to the
-    // running one. Remember it, so its menu leaves New Window out.
+    // New Window was picked for a running app: if no new window of it has
+    // appeared a few seconds later, it's one that hands a second launch over
+    // to the running one. Remember it, so its menu leaves New Window out.
+    // (New windows, not the count: one closed meanwhile would hide a new one.)
     watchNewWindow(app) {
-        const before = app.get_n_windows();
-        if (before === 0)
+        const before = new Set(app.get_windows());
+        if (before.size === 0)
             return;
         const id = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 5, () => {
             this._timeouts.delete(id);
-            if (this._docks && app.get_n_windows() <= before && !this.isSingleWindow(app)) {
+            const opened = app.get_windows().some(w => !before.has(w));
+            if (this._docks && !opened && !this.isSingleWindow(app)) {
                 this._singleWindow.add(app.id);
                 try {
                     writeConfig(this._config, [...this._singleWindow]);
@@ -905,16 +909,13 @@ export default class DockFoldersExtension extends Extension {
         const dock = this._docks.get(dash);
         if (!dock)
             return;
-        const [, others] = this._split(dash);
-        const order = [...others];
-        dock.folders
-            .map((folder, i) => ({folder, i, pos: this._entry(folder.id)?.position ?? Infinity}))
-            .sort((a, b) => a.pos - b.pos || a.i - b.i)
-            .forEach(({folder, pos}, inserted) => {
-                order.splice(Math.min(pos, others.length) + inserted, 0, folder.item);
-            });
+        const [folders, others] = this._split(dash);
+        const order = placeFolders(others, dock.folders.map(folder => ({
+            item: folder.item,
+            pos: this._entry(folder.id)?.position ?? Infinity,
+        })));
         order.forEach((actor, index) => {
-            if (dock.folders.some(f => f.item === actor) &&
+            if (folders.has(actor) &&
                 dash._box.get_child_at_index(index) !== actor)
                 Clutter.Actor.prototype.set_child_at_index.call(dash._box, actor, index);
         });
@@ -959,22 +960,16 @@ export default class DockFoldersExtension extends Extension {
         }
     }
 
-    moveFolder(id, position) {
-        const entry = this._entry(id);
-        if (!entry)
-            return;
-        entry.position = Math.max(0, position);
-        this._save();
-        this._docks.forEach((_dock, dash) => this._place(dash));
-    }
-
     nudgeFolder(id, item, step) {
         const dash = [...this._docks.keys()].find(d => d._box.contains(item));
-        if (!dash)
+        const entry = this._entry(id);
+        if (!dash || !entry)
             return;
         const [, others] = this._split(dash);
         const index = this._indexOf(dash, item);
-        this.moveFolder(id, Math.min(others.length, Math.max(0, index + step)));
+        entry.position = Math.min(others.length, Math.max(0, index + step));
+        this._save();
+        this._docks.forEach((_dock, d) => this._place(d));
     }
 
     removeFolder(id) {
@@ -1012,7 +1007,7 @@ export default class DockFoldersExtension extends Extension {
             if (!dash?._box || !dash._appSystem)
                 continue;
             const folders = this._config.map(({id}) => new DockFolder(this, dash, id));
-            this._docks.set(dash, {folders, restore: this._wrapDash(dash)});
+            this._docks.set(dash, {folders, restore: this._wrapDash(dock, dash)});
             folders.forEach(f => dash._box.add_child(f.item));
             this._place(dash);
         }
@@ -1020,27 +1015,30 @@ export default class DockFoldersExtension extends Extension {
     }
 
     // Takes over what this dock needs; returns what puts it back.
-    _wrapDash(dash) {
+    _wrapDash(dock, dash) {
         const box = dash._box;
         const ext = this;
 
         // Dash to Dock places its icons by index among its own: skip ours,
-        // then put ours back.
+        // then put ours back. Not the drag placeholder (pinning by drag):
+        // GNOME counts the whole row for it, folders too, and its acceptDrop
+        // reads that index back so (dash.js, handleDragOver).
         box.insert_child_at_index = (child, index) => {
             const [folders] = this._split(dash);
-            const children = box.get_children();
-            let raw = children.length, seen = 0;
-            for (let i = 0; i < children.length; i++) {
-                if (folders.has(children[i]))
-                    continue;
-                if (seen === index) {
-                    raw = i;
-                    break;
-                }
-                seen++;
-            }
+            const raw = child === dash._dragPlaceholder
+                ? index : rawIndex(box.get_children(), a => folders.has(a), index);
             Clutter.Actor.prototype.insert_child_at_index.call(box, child, raw);
             this._place(dash);
+        };
+
+        // Super+number: the Nth of the dock's own app icons, as its number
+        // overlays count them (getAppIcons leaves the folders out).
+        dock._activateApp = appIndex => {
+            const [folders] = this._split(dash);
+            const icons = box.get_children()
+                .filter(actor => !folders.has(actor) && actor.child?.app)
+                .map(actor => actor.child);
+            icons[appIndex]?.activate(1);
         };
         const removedId = box.connect('child-removed', () => {
             if (!this._detached)
@@ -1079,6 +1077,7 @@ export default class DockFoldersExtension extends Extension {
 
         return () => {
             delete box.insert_child_at_index;
+            delete dock._activateApp;
             delete dash.acceptDrop;
             box.disconnect(removedId);
             dash._appSystem = real;
@@ -1124,8 +1123,10 @@ export default class DockFoldersExtension extends Extension {
         this._entries = [];
     }
 
+    // Also re-counts: the badges follow the same settings.
     _resetIndicators() {
         this._docks?.forEach(dock => dock.folders.forEach(f => f.resetIndicator()));
+        this._stateChanged();
     }
 
     _stateChanged() {

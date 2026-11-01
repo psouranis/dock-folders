@@ -9,14 +9,7 @@ import Gio from 'gi://Gio';
 import {ExtensionPreferences, gettext as _} from
     'resource:///org/gnome/Shell/Extensions/js/extensions/prefs.js';
 
-import {readConfig, writeConfig} from './config.js';
-
-// GNOME's own folders are named after a .directory file ("Utilities"):
-// show the id for those.
-function displayName(id, settings) {
-    const name = settings.get_string('name');
-    return settings.get_boolean('translate') || name.endsWith('.directory') ? id : name;
-}
+import {folderName, folderSettings, readConfig, writeConfig} from './config.js';
 
 export default class DockFoldersPreferences extends ExtensionPreferences {
     fillPreferencesWindow(window) {
@@ -37,16 +30,13 @@ export default class DockFoldersPreferences extends ExtensionPreferences {
         const ids = folders.get_strv('folder-children');
         let shown = 0;
         for (const id of ids) {
-            const settings = new Gio.Settings({
-                schema_id: 'org.gnome.desktop.app-folders.folder',
-                path: `/org/gnome/desktop/app-folders/folders/${id}/`,
-            });
+            const settings = folderSettings(id);
             const apps = settings.get_strv('apps');
             if (apps.length === 0)
                 continue;          // a folder by category only (YaST...): no apps of its own
             shown++;
             const row = new Adw.SwitchRow({
-                title: displayName(id, settings),
+                title: folderName(settings) || id,
                 subtitle: apps.length === 1 ? _('1 app') : `${apps.length} ${_('apps')}`,
                 active: readConfig().some(f => f.id === id),
             });

@@ -29,6 +29,30 @@ export const KNOWN_SINGLE_WINDOW_APPS = [
     'slack.desktop',
 ];
 
+export function folderSettings(id) {
+    return new Gio.Settings({
+        schema_id: 'org.gnome.desktop.app-folders.folder',
+        path: `/org/gnome/desktop/app-folders/folders/${id}/`,
+    });
+}
+
+// An app-grid folder's name, as GNOME Shell shows it: a translated one
+// ("Utilities") is named by its .directory file, in the user's language
+// (shell_util_get_translated_folder_name). Here so the preferences window,
+// which can't load Shell, shows the same name as the dock.
+export function folderName(settings) {
+    const name = settings.get_string('name');
+    if (!settings.get_boolean('translate'))
+        return name;
+    try {
+        const keyfile = new GLib.KeyFile();
+        keyfile.load_from_data_dirs(`desktop-directories/${name}`, GLib.KeyFileFlags.NONE);
+        return keyfile.get_locale_string('Desktop Entry', 'Name', null);
+    } catch {
+        return name;
+    }
+}
+
 export const configFile = () => Gio.File.new_for_path(
     GLib.build_filenamev([GLib.get_user_config_dir(), 'dock-folders', 'folders.json']));
 
