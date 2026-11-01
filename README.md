@@ -2,6 +2,17 @@
 
 GNOME's app folders in [Dash to Dock](https://github.com/micheleg/dash-to-dock).
 
+<table>
+  <tr>
+    <td align="center"><img src="screenshots/dock-left.png" alt="A Messaging folder in a dock on the left, its pop-up open with Signal, Discord, Slack, Viber and Thunderbird and their unread badges" width="260"></td>
+    <td align="center"><img src="screenshots/dock-bottom.png" alt="The same folder in a dock at the bottom, its pop-up open above it" width="560"></td>
+  </tr>
+  <tr>
+    <td align="center">Dock on the left</td>
+    <td align="center">Dock at the bottom</td>
+  </tr>
+</table>
+
 - **A folder in the dock**: a rounded square showing its first four apps.
   Click it and its apps open in a pop-up grid, each with its name; click one
   to open it, or bring its window forward. Right-click one for its own app
