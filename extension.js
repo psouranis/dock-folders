@@ -13,10 +13,12 @@
 //   - Drop an app icon on it (from the dock or Show Apps) to put the app in
 //     the folder; drag an app out of its pop-up to take it out (and unpin
 //     it).
-//   - Drag the folder along the dock to move it (the icons make room as it
-//     goes, as for an app), or right-click it: Move
+//   - Drag the folder along the dock to move it (a gap opens where it will
+//     go, as for an app), or right-click it: Rename, Move
 //     Left / Move Right, Remove from Dock, Settings (which folders are in
 //     the dock: prefs.js).
+//   - Right-click an app in the dock: Add to Folder puts it in one of the
+//     dock's folders, or New Folder… makes one with it, where it was.
 //
 // Each folder's name and apps are the app-grid folder's own
 // (org.gnome.desktop.app-folders), read live: make a folder in Show Apps by
@@ -37,12 +39,16 @@
 //     apps out;
 //   - the running indicator is Dash to Dock's own AppIconIndicator, drawn on
 //     a folder icon built like GNOME's app icons (FolderIcon below).
-// disable() undoes all three.
+//   - its app icons' popupMenu is wrapped to add Add to Folder to their menu;
+//   - an app dragged along a dock with folders is placed by this
+//     (handleDragOver, acceptDrop), so it can go between apps and folders.
+// disable() undoes all of it.
 
 import Clutter from 'gi://Clutter';
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 import GObject from 'gi://GObject';
+import Meta from 'gi://Meta';
 import Shell from 'gi://Shell';
 import St from 'gi://St';
 
@@ -51,8 +57,10 @@ import * as AppFavorites from 'resource:///org/gnome/shell/ui/appFavorites.js';
 import {AppMenu} from 'resource:///org/gnome/shell/ui/appMenu.js';
 import * as Dash from 'resource:///org/gnome/shell/ui/dash.js';
 import * as BoxPointer from 'resource:///org/gnome/shell/ui/boxpointer.js';
+import * as Dialog from 'resource:///org/gnome/shell/ui/dialog.js';
 import * as DND from 'resource:///org/gnome/shell/ui/dnd.js';
 import * as IconGrid from 'resource:///org/gnome/shell/ui/iconGrid.js';
+import * as ModalDialog from 'resource:///org/gnome/shell/ui/modalDialog.js';
 import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
 import {Extension, gettext as _} from 'resource:///org/gnome/shell/extensions/extension.js';
 import {ExtensionState} from 'resource:///org/gnome/shell/misc/extensionUtils.js';
@@ -61,7 +69,7 @@ import {
     KNOWN_SINGLE_WINDOW_APPS, configFile, folderName, folderSettings, readConfig,
     readSingleWindowApps, writeConfig,
 } from './config.js';
-import {placeFolders, rawIndex} from './order.js';
+import {folderEntries, moveInRow, newFolderId, placeFolders, rawIndex} from './order.js';
 
 const DASH_TO_DOCK = 'dash-to-dock@micxgx.gmail.com';
 const POPUP_ICON_SIZE = 56;
@@ -176,6 +184,31 @@ function appFromDragSource(source) {
 
 // Dash to Dock's own running indicator for `source` (a FolderIcon), in the
 // style it's set to. Its unread badge is left out: the folder has its own.
+// Asks for a folder's name in a GNOME Shell dialog, `text` filled in;
+// `done(name)` with the name typed (trimmed, not empty) when confirmed.
+function askName(title, text, confirm, done) {
+    const dialog = new ModalDialog.ModalDialog({styleClass: 'dock-folders-name-dialog'});
+    const content = new Dialog.MessageDialogContent({title});
+    const entry = new St.Entry({text, can_focus: true, x_expand: true});
+    content.add_child(entry);
+    dialog.contentLayout.add_child(content);
+    const ok = () => {
+        const name = entry.get_text().trim();
+        if (!name)
+            return;
+        dialog.close();
+        done(name);
+    };
+    entry.clutter_text.connect('activate', ok);
+    dialog.setButtons([
+        {label: _('Cancel'), action: () => dialog.close(), key: Clutter.KEY_Escape},
+        {label: confirm, action: ok, default: true},
+    ]);
+    dialog.setInitialKeyFocus(entry);
+    dialog.open();
+    entry.clutter_text.set_selection(0, text.length);
+}
+
 function makeIndicator(indicators, source) {
     if (!indicators || !source.app)
         return null;
@@ -333,6 +366,8 @@ class DockFolder {
     }
 
     _fillActions() {
+        this._actions.addAction(_('Rename…'), () => this._ext.renameFolder(this.id));
+        this._actions.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
         this._actions.addAction(_('Move Left'), () => this._ext.nudgeFolder(this.id, this.item, -1));
         this._actions.addAction(_('Move Right'), () => this._ext.nudgeFolder(this.id, this.item, 1));
         this._actions.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
@@ -663,6 +698,7 @@ export default class DockFoldersExtension extends Extension {
         this._watched = [];          // [settings, signal id] per folder
         this._entries = [];          // disconnect functions (counts, windows)
         this._hidden = new Set();    // desktop ids kept out of the dock
+        this._placeholders = new Set();   // the gaps shown while a folder is dragged
         this._singleWindow = new Set(readSingleWindowApps());
         this._timeouts = new Set();
         this._dragMonitor = {dragMotion: event => this._dragMotion(event)};
@@ -700,6 +736,8 @@ export default class DockFoldersExtension extends Extension {
         const indicators = await import(dtd.dir.get_child('appIconIndicators.js').get_uri());
         if (!this._docks || !module.dockManager || module.dockManager === this._manager)
             return;
+        if (!module.dockManager.settings)
+            return;   // Dash to Dock half-loaded: its next state change hooks again
         this._unhook();
         this._manager = module.dockManager;
         this.indicators = indicators;
@@ -727,7 +765,7 @@ export default class DockFoldersExtension extends Extension {
         this._clear();
         if (this._manager) {
             this._managerIds.forEach(id => this._manager.disconnect(id));
-            this._settingsIds?.forEach(id => this._manager.settings.disconnect(id));
+            this._settingsIds?.forEach(id => this._manager.settings?.disconnect(id));
             if (this._monitorId)
                 this._manager.notificationsMonitor?.disconnect(this._monitorId);
             if (this._monitorStateId)
@@ -812,8 +850,13 @@ export default class DockFoldersExtension extends Extension {
     // Its place follows the pointer while it's dragged (the dock's icons
     // move aside, as for an app); dropped, it's saved; cancelled, put back.
 
+    // While a folder is dragged along the dock, a gap opens where it would
+    // go, as GNOME's dash does for an app (dash.js, handleDragOver: the
+    // same placeholder, the slot worked out without it, none right before or
+    // after the folder itself). Let go there, it moves there; Esc, or let go
+    // off the dock, and nothing changes.
     beginFolderDrag(folder) {
-        this._folderDrag = {folder, from: this._entry(folder.id)?.position ?? null};
+        this._folderDrag = {folder, placeholder: null, dash: null, slot: -1, index: null};
     }
 
     endFolderDrag(folder, dropped) {
@@ -821,27 +864,99 @@ export default class DockFoldersExtension extends Extension {
         if (!drag || drag.folder !== folder)
             return;
         this._folderDrag = null;
-        const entry = this._entry(folder.id);
-        if (!entry)
-            return;
-        if (dropped)
+        const {dash, index} = drag;
+        const move = dropped && drag.placeholder && index !== null;
+        this._clearPlaceholder(drag, !move);
+        if (move && this._moveTo(dash, folder.id, index))
             this._save();
-        else
-            entry.position = drag.from;
-        this._docks.forEach((_dock, dash) => this._place(dash));
     }
 
     _previewFolderDrag() {
-        const {folder} = this._folderDrag;
-        const entry = this._entry(folder.id);
+        const drag = this._folderDrag;
+        const {folder} = drag;
         const dash = [...this._docks.keys()].find(d => d._box.contains(folder.item));
-        if (!entry || !dash || !pointerOver(dash._box))
+        if (!dash || !pointerOver(dash._box)) {
+            this._clearPlaceholder(drag, true);
             return;
-        const index = this.dropIndex(dash, folder.item);
-        if (entry.position === index)
+        }
+        const children = dash._box.get_children().filter(a => !this._placeholders.has(a));
+        const slot = this._slotAt(dash, children,
+            drag.dash === dash ? drag.placeholder : null, drag.slot, folder.item);
+        const self = children.indexOf(folder.item);
+        if (slot === self || slot === self + 1) {
+            this._clearPlaceholder(drag, true);   // where it is already
             return;
-        entry.position = index;
-        this._docks.forEach((_dock, d) => this._place(d));
+        }
+        if (drag.placeholder && drag.dash === dash && drag.slot === slot)
+            return;
+        const fresh = !drag.placeholder;
+        this._clearPlaceholder(drag, false);
+        const placeholder = this._makePlaceholder(dash, children, slot, fresh);
+        Object.assign(drag, {placeholder, dash, slot, index: slot > self ? slot - 1 : slot});
+    }
+
+    // A gap like GNOME's dash's (DragPlaceholderItem), sized as Dash to Dock
+    // sizes it (half an icon along the dock), put before icon `slot` of
+    // `children`: counted without any gap still closing (they are in the
+    // dock's row until they're gone).
+    _makePlaceholder(dash, children, slot, animate) {
+        const placeholder = new Dash.DashItemContainer();
+        placeholder.setChild(new St.Bin({style_class: 'placeholder'}));
+        const size = dash.iconSize ?? this.defaultIconSize;
+        if (dash._isHorizontal ?? true)
+            placeholder.child.set_size(size, size / 2);
+        else
+            placeholder.child.set_size(size / 2, size);
+        this._placeholders.add(placeholder);
+        placeholder.connect('destroy', () => this._placeholders?.delete(placeholder));
+        const anchor = children[slot];
+        const raw = anchor ? dash._box.get_children().indexOf(anchor) : dash._box.get_n_children();
+        Clutter.Actor.prototype.insert_child_at_index.call(dash._box, placeholder, raw);
+        placeholder.show(animate);
+        return placeholder;
+    }
+
+    _clearPlaceholder(drag, animate) {
+        const {placeholder} = drag;
+        Object.assign(drag, {placeholder: null, slot: -1, index: null});
+        if (!placeholder)
+            return;
+        if (animate)
+            placeholder.animateOutAndDestroy();
+        else
+            placeholder.destroy();
+    }
+
+    // Which gap of the dock's row (`children`, without the placeholder) the
+    // pointer is in: after every icon whose middle it's past. Measured as if
+    // there were no placeholder (the icons after it are pushed along by its
+    // size), so that showing it can't change the answer and make it jump.
+    _slotAt(dash, children, placeholder, placeholderSlot, skip) {
+        const [px, py] = global.get_pointer();
+        const horizontal = dash._isHorizontal ?? true;
+        const along = actor => {
+            const [x, y] = actor.get_transformed_position();
+            const [w, h] = actor.get_transformed_size();
+            return horizontal ? [x, w] : [y, h];
+        };
+        let shift = 0;
+        const ph = placeholder;
+        if (ph) {
+            const next = children[placeholderSlot];
+            if (next)
+                shift = along(next)[0] - along(ph)[0];
+        }
+        const pointer = horizontal ? px : py;
+        let slot = 0;
+        children.forEach((actor, i) => {
+            if (!actor.visible || actor === skip)
+                return;
+            const [start, size] = along(actor);
+            const middle = start - (ph && i >= placeholderSlot ? shift : 0) + size / 2;
+            if (pointer > middle)
+                slot = i + 1;
+        });
+        return slot;
     }
 
     // Lights the folder under a dragged app, and no other; moves a dragged
@@ -900,7 +1015,8 @@ export default class DockFoldersExtension extends Extension {
     // in its row).
     _split(dash) {
         const folders = new Set(this._docks.get(dash)?.folders.map(f => f.item) ?? []);
-        const others = dash._box.get_children().filter(a => !folders.has(a));
+        const others = dash._box.get_children()
+            .filter(a => !folders.has(a) && !this._placeholders?.has(a));
         return [folders, others];
     }
 
@@ -910,10 +1026,18 @@ export default class DockFoldersExtension extends Extension {
         if (!dock)
             return;
         const [folders, others] = this._split(dash);
-        const order = placeFolders(others, dock.folders.map(folder => ({
-            item: folder.item,
-            pos: this._entry(folder.id)?.position ?? Infinity,
-        })));
+        // In the config's order: it decides which of two folders in the same
+        // gap comes first (placeFolders keeps the order it's given for ties).
+        const rank = id => {
+            const i = this._config.findIndex(f => f.id === id);
+            return i < 0 ? Infinity : i;
+        };
+        const order = placeFolders(others, [...dock.folders]
+            .sort((a, b) => rank(a.id) - rank(b.id))
+            .map(folder => ({
+                item: folder.item,
+                pos: this._entry(folder.id)?.position ?? Infinity,
+            })));
         order.forEach((actor, index) => {
             if (folders.has(actor) &&
                 dash._box.get_child_at_index(index) !== actor)
@@ -934,18 +1058,118 @@ export default class DockFoldersExtension extends Extension {
         return index;
     }
 
-    // Where a dragged folder was let go: how many of the dock's own icons
-    // are before the pointer.
-    dropIndex(dash, item) {
-        const [x, y] = global.get_pointer();
-        const [, others] = this._split(dash);
-        const horizontal = dash._isHorizontal ?? true;
-        const visible = others.filter(a => a.visible && a !== item);
-        return visible.filter(actor => {
-            const [ax, ay] = actor.get_transformed_position();
-            const [w, h] = actor.get_transformed_size();
-            return horizontal ? x > ax + w / 2 : y > ay + h / 2;
-        }).length;
+    // The dock's row as order.js sees it: each folder, and every other icon.
+    _row(dash) {
+        const byItem = new Map(this._docks.get(dash)?.folders.map(f => [f.item, f.id]) ?? []);
+        return dash._box.get_children()
+            .filter(a => !this._placeholders?.has(a))
+            .map(a => (byItem.has(a) ? {folder: byItem.get(a)} : {}));
+    }
+
+    // Puts folder `id` at `index` of this dock's row (without it): every
+    // folder's position, and the order of folders sharing a gap, follow.
+    // Not saved: the caller saves (a drag only when it's dropped).
+    // An app dragged over a dock with folders: a gap where it would go, as
+    // GNOME's dash shows it (none right before or after its own icon, none
+    // past the pinned apps and folders), placed as for a dragged folder.
+    _appDragOver(dash, app) {
+        const box = dash._box;
+        if (dash._dragPlaceholder && !this._placeholders.has(dash._dragPlaceholder))
+            dash._clearDragPlaceholder();   // one of GNOME's, from before a folder came
+        const current = dash._dragPlaceholder;
+        const children = box.get_children().filter(a => !this._placeholders.has(a));
+        const [folders] = this._split(dash);
+        const favorites = AppFavorites.getAppFavorites().getFavoriteMap();
+        const id = app.get_id();
+        const own = children.findIndex(a => a.child?.app?.get_id?.() === id);
+        let limit = 0;
+        children.forEach((a, i) => {
+            const childId = a.child?.app?.get_id?.();
+            if (folders.has(a) || (childId && childId in favorites))
+                limit = i + 1;
+        });
+        const slot = Math.min(limit,
+            this._slotAt(dash, children, current, current ? dash._dockFoldersSlot : -1, null));
+        if (own !== -1 && (slot === own || slot === own + 1)) {
+            if (current)
+                dash._clearDragPlaceholder();
+            dash._dockFoldersSlot = -1;
+            return DND.DragMotionResult.CONTINUE;
+        }
+        if (current && dash._dockFoldersSlot === slot)
+            return DND.DragMotionResult.MOVE_DROP;
+        current?.destroy();
+        const placeholder = this._makePlaceholder(dash, children, slot, !current);
+        dash._dragPlaceholder = placeholder;
+        dash._dragPlaceholderPos = box.get_children().indexOf(placeholder);
+        dash._dockFoldersSlot = slot;
+        return DND.DragMotionResult.MOVE_DROP;
+    }
+
+    // The app dropped in the gap: among the pinned apps after the pinned
+    // apps before the gap (as GNOME's acceptDrop does it, later, before the
+    // next redraw), and every folder where the gap's row has it, so an app
+    // moved past a folder stays past it.
+    _appDrop(dash, app, placeholder) {
+        if (app.is_window_backed() || !global.settings.is_writable('favorite-apps'))
+            return false;
+        const id = app.get_id();
+        const appFavorites = AppFavorites.getAppFavorites();
+        const favorites = appFavorites.getFavoriteMap();
+        const byItem = new Map(this._docks.get(dash)?.folders.map(f => [f.item, f.id]) ?? []);
+        const row = [];
+        let favPos = 0;
+        let before = true;
+        for (const actor of dash._box.get_children()) {
+            if (actor === placeholder) {
+                row.push({});   // the app, where it goes
+                before = false;
+            } else if (this._placeholders.has(actor)) {
+                continue;
+            } else if (byItem.has(actor)) {
+                row.push({folder: byItem.get(actor)});
+            } else {
+                const childId = actor.child?.app?.get_id?.();
+                if (childId === id)
+                    continue;   // its icon now: it moves
+                row.push({});
+                if (before && childId && childId in favorites)
+                    favPos++;
+            }
+        }
+        const entries = folderEntries(row);
+        const placed = new Set(entries.map(e => e.id));
+        this._config = [...entries, ...this._config.filter(e => !placed.has(e.id))];
+        this._save();
+        console.log(`Dock Folders: drop ${id} at pinned ${favPos}; folders ${JSON.stringify(this._config)}`);
+        global.compositor.get_laters().add(Meta.LaterType.BEFORE_REDRAW, () => {
+            if (id in favorites)
+                appFavorites.moveFavoriteToPos(id, favPos);
+            else
+                appFavorites.addFavoriteAtPos(id, favPos);
+            return GLib.SOURCE_REMOVE;
+        });
+        return true;
+    }
+
+    // What the dock's row holds, for the log: app ids, [folder ids].
+    _describeRow(dash) {
+        const byItem = new Map(this._docks.get(dash)?.folders.map(f => [f.item, f.id]) ?? []);
+        return dash._box.get_children().filter(a => !this._placeholders?.has(a)).map(a => byItem.has(a) ? `[${byItem.get(a)}]`
+            : `${(a.child?.app?.get_id() ?? a.constructor?.name ?? '?').replace(/\.desktop$/, '')}${a.visible ? '' : '(hidden)'}`).join(' ');
+    }
+
+    _moveTo(dash, id, index) {
+        console.log(`Dock Folders: move ${id} to ${index}; row: ${this._describeRow(dash)}`);
+        const entries = folderEntries(moveInRow(this._row(dash), id, index));
+        const placed = new Set(entries.map(e => e.id));
+        const config = [...entries, ...this._config.filter(e => !placed.has(e.id))];
+        if (JSON.stringify(config) === JSON.stringify(this._config))
+            return false;
+        this._config = config;
+        this._docks.forEach((_dock, d) => this._place(d));
+        console.log(`Dock Folders: now ${JSON.stringify(config)}; row: ${this._describeRow(dash)}`);
+        return true;
     }
 
     _entry(id) {
@@ -960,16 +1184,23 @@ export default class DockFoldersExtension extends Extension {
         }
     }
 
+    // Move Left / Move Right: past the next icon that way, app or folder.
     nudgeFolder(id, item, step) {
         const dash = [...this._docks.keys()].find(d => d._box.contains(item));
-        const entry = this._entry(id);
-        if (!dash || !entry)
+        if (!dash || !this._entry(id))
             return;
-        const [, others] = this._split(dash);
-        const index = this._indexOf(dash, item);
-        entry.position = Math.min(others.length, Math.max(0, index + step));
-        this._save();
-        this._docks.forEach((_dock, d) => this._place(d));
+        const children = dash._box.get_children();
+        let i = children.indexOf(item);
+        do
+            i += step;
+        while (i >= 0 && i < children.length && !children[i].visible);
+        if (i < 0 || i >= children.length)
+            return;   // already first or last
+        // In the row without it, the neighbour's index is `i` either way
+        // (to its right it shifts down one): there it goes before (left) or
+        // just after (right) it.
+        if (this._moveTo(dash, id, i))
+            this._save();
     }
 
     removeFolder(id) {
@@ -978,9 +1209,102 @@ export default class DockFoldersExtension extends Extension {
         this._rebuild();
     }
 
+    renameFolder(id) {
+        const settings = folderSettings(id);
+        askName(_('Rename Folder'), folderName(settings), _('Rename'), name => {
+            settings.set_boolean('translate', false);
+            settings.set_string('name', name);
+        });
+    }
+
+    // --- Folders from an app's menu in the dock -----------------------------
+    // Dash to Dock builds an app icon's menu each time it opens
+    // (appIcons.js, popupMenu -> DockAppIconMenu._rebuildMenu), so its
+    // icons' popupMenu is wrapped to add "Add to Folder" after it, while
+    // this is on: each dock folder, and New Folder….
+
+    _patchAppMenus() {
+        if (!this._docks)
+            return;
+        this._menuPatches ??= new Map();   // icon class prototype -> undo
+        const ext = this;
+        const icons = [...this._docks.keys()]
+            .flatMap(dash => dash._box.get_children())
+            .map(actor => actor.child)
+            .filter(child => child?.app && typeof child.popupMenu === 'function');
+        for (const icon of icons) {
+            const proto = Object.getPrototypeOf(icon);
+            if (this._menuPatches.has(proto))
+                continue;
+            const own = Object.prototype.hasOwnProperty.call(proto, 'popupMenu');
+            const original = proto.popupMenu;
+            proto.popupMenu = function (...args) {
+                const result = original.apply(this, args);
+                try {
+                    ext._addFolderItems(this);
+                } catch (e) {
+                    console.warn(`Dock Folders: ${e.message}`);
+                }
+                return result;
+            };
+            this._menuPatches.set(proto, () => {
+                if (own)
+                    proto.popupMenu = original;
+                else
+                    delete proto.popupMenu;
+            });
+            console.log(`Dock Folders: Add to Folder in the menus of ${proto.constructor?.name ?? 'dock icons'}`);
+        }
+    }
+
+    _unpatchAppMenus() {
+        this._menuPatches?.forEach(undo => undo());
+        this._menuPatches = new Map();
+    }
+
+    _addFolderItems(icon) {
+        const {app, _menu: menu} = icon;
+        if (!menu || !app || !this._docks)
+            return;
+        const sub = new PopupMenu.PopupSubMenuMenuItem(_('Add to Folder'));
+        for (const {id} of this._config)
+            sub.menu.addAction(folderName(folderSettings(id)), () => this.addToFolder(id, app));
+        if (this._config.length > 0)
+            sub.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
+        sub.menu.addAction(_('New Folder…'), () => this.newFolder(app, icon));
+        menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
+        menu.addMenuItem(sub);
+    }
+
+    // A new app-grid folder with `app` in it (out of any other), in the dock
+    // where the app's icon was; the app unpinned, as the folder stands for
+    // it now. Its name is asked for first.
+    newFolder(app, icon) {
+        const dash = [...this._docks.keys()].find(d => d._box.contains(icon));
+        const position = dash ? this._indexOf(dash, icon.get_parent()) : null;
+        askName(_('New Folder'), _('New Folder'), _('Create'), name => {
+            if (!this._docks)
+                return;
+            const folders = new Gio.Settings({schema_id: 'org.gnome.desktop.app-folders'});
+            for (const other of folders.get_strv('folder-children'))
+                this._removeApp(other, app);
+            const id = newFolderId(name, folders.get_strv('folder-children'));
+            const settings = folderSettings(id);
+            settings.set_string('name', name);
+            settings.set_boolean('translate', false);
+            settings.set_strv('apps', [app.id]);
+            folders.set_strv('folder-children', [...folders.get_strv('folder-children'), id]);
+            this._config.push({id, position});
+            this._save();
+            unpin(app);
+            this._rebuild();
+        });
+    }
+
     // --- Building ----------------------------------------------------------
 
     _clear() {
+        this._unpatchAppMenus();
         // Unwrap first: removing the folder icons must not re-place them.
         this._docks?.forEach(dock => {
             dock.restore();
@@ -1011,6 +1335,7 @@ export default class DockFoldersExtension extends Extension {
             folders.forEach(f => dash._box.add_child(f.item));
             this._place(dash);
         }
+        this._patchAppMenus();
         this._folderChanged();
     }
 
@@ -1044,12 +1369,35 @@ export default class DockFoldersExtension extends Extension {
             if (!this._detached)
                 this._place(dash);
         });
+        // Right after a Shell start the docks are ready before their icons
+        // are drawn: the app menus are wrapped when the first one comes.
+        const addedId = box.connect('child-added', () => this._patchAppMenus());
+
+        // Dragging an app along the dock (pinning it, or moving it among the
+        // pinned apps) with folders in it: GNOME's dash works out the gap
+        // from every icon in the row, folders too, but against the pinned
+        // apps alone, and a folder's place ("after N icons") wouldn't follow
+        // an app moved past it. So with folders here, the gap is placed as
+        // for a dragged folder, and the drop moves the app among the pinned
+        // apps and every folder to where the gap had it (_appDragOver,
+        // _appDrop). Without folders, GNOME's and Dash to Dock's own code.
+        const handleDragOver = dash.handleDragOver;
+        dash.handleDragOver = (source, actor, x, y, time) => {
+            const app = appFromDragSource(source);
+            if (!app || app.is_window_backed() || this._split(dash)[0].size === 0)
+                return handleDragOver.call(dash, source, actor, x, y, time);
+            return this._appDragOver(dash, app);
+        };
 
         // Pinning an app by dropping it on the dock: GNOME's acceptDrop reads
         // an app from every icon before the drop point, and a folder has
         // none. The folders are out of the row while it runs.
         const acceptDrop = dash.acceptDrop;
         dash.acceptDrop = (...args) => {
+            const app = appFromDragSource(args[0]);
+            const placeholder = dash._dragPlaceholder;
+            if (app && placeholder && this._placeholders.has(placeholder))
+                return this._appDrop(dash, app, placeholder);
             const [folders] = this._split(dash);
             this._detached = true;
             folders.forEach(item => box.remove_child(item));
@@ -1079,7 +1427,9 @@ export default class DockFoldersExtension extends Extension {
             delete box.insert_child_at_index;
             delete dock._activateApp;
             delete dash.acceptDrop;
+            delete dash.handleDragOver;
             box.disconnect(removedId);
+            box.disconnect(addedId);
             dash._appSystem = real;
             try {
                 dash._queueRedisplay();
@@ -1091,6 +1441,7 @@ export default class DockFoldersExtension extends Extension {
 
     // A folder's name or apps changed: redraw, re-hide, re-count.
     _folderChanged() {
+        this._patchAppMenus();   // in case the dock had no app icon to patch yet
         this._docks.forEach(dock => dock.folders.forEach(f => f.update()));
         this._hidden = new Set(this._watched.flatMap(([settings]) => settings.get_strv('apps')));
         this._docks.forEach((_dock, dash) => dash._queueRedisplay());

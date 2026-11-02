@@ -2,7 +2,7 @@
 
 import System from 'system';
 
-import {placeFolders, rawIndex} from '../order.js';
+import {folderEntries, moveInRow, newFolderId, placeFolders, rawIndex} from '../order.js';
 
 let failed = 0;
 function check(name, got, want) {
@@ -33,6 +33,25 @@ check('raw index before the folder', rawIndex(['A', 'F', 'B', 'C'], isFolder, 0)
 check('raw index skips the folder', rawIndex(['A', 'F', 'B', 'C'], isFolder, 1), 2);
 check('raw index past the last icon', rawIndex(['A', 'F', 'B', 'C'], isFolder, 3), 4);
 check('raw index with a folder first', rawIndex(['F', 'A'], isFolder, 0), 1);
+
+check('a folder id: letters and digits of its name', newFolderId('Read & Write', []), 'ReadWrite');
+check('a folder id: accents dropped', newFolderId('Café 2', []), 'Cafe2');
+check('a folder id: a name with no letters', newFolderId('Μουσική', []), 'Folder');
+check('a folder id: numbered when taken', newFolderId('Work', ['Work', 'Work2']), 'Work3');
+
+// Two folders in the same gap (A [F] [G] B), as the bug had them: they swap.
+const row = [{}, {folder: 'F'}, {folder: 'G'}, {}];
+check('swap two folders in one gap: entries', folderEntries(moveInRow(row, 'F', 2)),
+    [{id: 'G', position: 1}, {id: 'F', position: 1}]);
+check('...and placeFolders puts them back in that order',
+    placeFolders(['A', 'B'], folderEntries(moveInRow(row, 'F', 2)).map(e => ({item: e.id, pos: e.position}))),
+    ['A', 'G', 'F', 'B']);
+check('move a folder past an app', folderEntries(moveInRow(row, 'G', 3)),
+    [{id: 'F', position: 1}, {id: 'G', position: 2}]);
+check('to the start', folderEntries(moveInRow(row, 'G', 0)),
+    [{id: 'G', position: 0}, {id: 'F', position: 1}]);
+check('index past the end is clamped', folderEntries(moveInRow(row, 'F', 99)),
+    [{id: 'G', position: 1}, {id: 'F', position: 2}]);
 
 if (failed > 0)
     System.exit(1);

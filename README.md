@@ -34,10 +34,14 @@ GNOME's app folders in [Dash to Dock](https://github.com/micheleg/dash-to-dock).
   added to the app folder (and out of any other), unpinned from the dock.
   Drag an app out of the pop-up and let go anywhere but the folder: it
   leaves the folder (and isn't pinned), so it's back to a plain app.
-- **Move it**: drag the folder along the dock; the icons make room as it
-  goes, as for an app, and it stays where you let go (Esc puts it back).
-  Or right-click it: Move Left,
-  Move Right, Remove from Dock, Dock Folders Settings.
+- **Make folders from the dock**: right-click an app in the dock → **Add to
+  Folder** → one of the dock's folders, or **New Folder…**: name it, and a
+  folder with that app takes the app's place in the dock.
+- **Move it, rename it**: drag the folder along the dock; a gap opens where
+  it will go, between any two icons (apps or folders), as when you drag an
+  app, and it goes there when you let go (Esc, or letting go off the dock,
+  leaves it where it was). Or right-click it: Rename…, Move Left, Move Right, Remove from
+  Dock, Dock Folders Settings.
 - **Any folder**: the settings window (Extensions app, or right-click a dock
   folder) has a switch per app folder.
 
@@ -63,8 +67,8 @@ the Extensions app, or `gnome-extensions enable dock-folders@psouranis.github.io
 
 ## Use
 
-1. Make a folder: open Show Apps, drop one app on another, drag more apps
-   in, click the folder to rename it.
+1. Make a folder: right-click an app in the dock → Add to Folder → New
+   Folder…. (Or in Show Apps: drop one app on another.)
 2. Put it in the dock: right-click a dock folder → Dock Folders Settings, or
    the Extensions app → Dock Folders → settings, and switch it on.
 3. Drag it to where you want it.

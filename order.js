@@ -28,3 +28,37 @@ export function rawIndex(children, isFolder, index) {
     }
     return children.length;
 }
+
+// An id for a new app-grid folder named `name`: its letters and digits (the
+// id is a dconf path element), "Folder" if none, and a number after it when
+// `taken` (the folder ids there are) has it already.
+export function newFolderId(name, taken) {
+    const base = (name ?? '').normalize('NFKD').replace(/[^A-Za-z0-9]+/g, '') || 'Folder';
+    let id = base;
+    for (let n = 2; taken.includes(id); n++)
+        id = `${base}${n}`;
+    return id;
+}
+
+// A dock's row as the folders see it: one entry per icon in order, a folder
+// as {folder: id}, any other icon as {}. moveInRow puts folder `id` at
+// `index` of the row without it; folderEntries gives each folder's config
+// entry, in row order: its position (how many other icons come before it)
+// and, by that order, its place among folders in the same gap.
+export function moveInRow(row, id, index) {
+    const rest = row.filter(t => t.folder !== id);
+    rest.splice(Math.max(0, Math.min(index, rest.length)), 0, {folder: id});
+    return rest;
+}
+
+export function folderEntries(row) {
+    let icons = 0;
+    const entries = [];
+    for (const t of row) {
+        if (t.folder !== undefined)
+            entries.push({id: t.folder, position: icons});
+        else
+            icons++;
+    }
+    return entries;
+}
